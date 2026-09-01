@@ -1,73 +1,61 @@
-import { Resend } from "resend";
-
 type MarketingSignup = {
   email: string;
   firstName?: string;
 };
 
-function getResendClient() {
-  const apiKey = process.env.RESEND_API_KEY;
-  const audienceId = process.env.RESEND_AUDIENCE_ID;
-  if (!apiKey || !audienceId) {
-    return {
-      client: null as Resend | null,
-      audienceId: null as string | null,
-      reason: !apiKey ? "missing_resend_api_key" : "missing_resend_audience_id",
-    };
+type SheetAction = "add" | "remove";
+
+async function callSheetBridge(payload: {
+  action: SheetAction;
+  email: string;
+  firstName?: string;
+}) {
+  const url = process.env.GOOGLE_SHEETS_WEBHOOK_URL;
+  if (!url) {
+    return { skipped: true as const, reason: "missing_google_sheets_webhook_url" };
   }
-  return { client: new Resend(apiKey), audienceId, reason: null as string | null };
+
+  const secret = process.env.GOOGLE_SHEETS_WEBHOOK_SECRET;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: payload.action,
+      email: payload.email,
+      firstName: payload.firstName ?? "",
+      secret: secret ?? "",
+    }),
+  });
+
+  const text = await response.text();
+  let parsed: { ok?: boolean; error?: string } = {};
+  try {
+    parsed = JSON.parse(text) as { ok?: boolean; error?: string };
+  } catch {
+    parsed = {};
+  }
+
+  if (!response.ok || parsed.ok === false) {
+    throw new Error(
+      parsed.error ||
+        `Google Sheet bridge failed (${response.status}): ${text.slice(0, 200)}`,
+    );
+  }
+
+  return { skipped: false as const };
 }
 
-/** Add paid subscriber to Resend audience market-this-morning-paid after checkout. */
+/** Add paid subscriber to the Google Sheet paid list after checkout. */
 export async function addPaidAudienceContact({
   email,
   firstName,
 }: MarketingSignup) {
-  const { client, audienceId, reason } = getResendClient();
-  if (!client || !audienceId) {
-    return { skipped: true as const, reason: reason ?? "missing_config" };
-  }
-
-  const { error } = await client.contacts.create({
-    audienceId,
-    email,
-    firstName,
-    unsubscribed: false,
-  });
-
-  // Ignore duplicate / validation conflicts so webhook retries stay idempotent.
-  if (error && !/already|exists|duplicate/i.test(error.message)) {
-    throw new Error(error.message);
-  }
-
-  return { skipped: false as const };
+  return callSheetBridge({ action: "add", email, firstName });
 }
 
-/** Remove or unsubscribe canceled members from the paid audience. */
+/** Mark canceled members on the Google Sheet paid list. */
 export async function removePaidAudienceContact(email: string) {
-  const { client, audienceId, reason } = getResendClient();
-  if (!client || !audienceId) {
-    return { skipped: true as const, reason: reason ?? "missing_config" };
-  }
-
-  const { error } = await client.contacts.remove({
-    audienceId,
-    email,
-  });
-
-  if (error) {
-    // Fallback: mark unsubscribed if hard remove is unavailable.
-    const update = await client.contacts.update({
-      audienceId,
-      email,
-      unsubscribed: true,
-    });
-    if (update.error) {
-      throw new Error(update.error.message || error.message);
-    }
-  }
-
-  return { skipped: false as const };
+  return callSheetBridge({ action: "remove", email });
 }
 
 /** @deprecated Prefer webhook-driven addPaidAudienceContact */
