@@ -19,7 +19,43 @@ async function emailFromSubscription(
   if (!customerId) return null;
   const customer = await stripe.customers.retrieve(customerId);
   if (customer.deleted) return null;
-  return customer.email ?? null;
+  return {
+    email: customer.email ?? null,
+    firstName: customer.name?.trim().split(/\s+/)[0] || undefined,
+  };
+}
+
+function isMarketBriefSubscription(subscription: Stripe.Subscription) {
+  const priceId = process.env.STRIPE_PRICE_ID;
+  return !priceId || subscription.items.data.some((item) => item.price.id === priceId);
+}
+
+function subscriptionIsEntitled(subscription: Stripe.Subscription) {
+  return isMarketBriefSubscription(subscription) && ["active", "trialing"].includes(subscription.status);
+}
+
+async function customerHasEntitlement(stripe: Stripe, customerId: string) {
+  const subscriptions = await stripe.subscriptions.list({
+    customer: customerId,
+    status: "all",
+    limit: 100,
+  });
+  return subscriptions.data.some(subscriptionIsEntitled);
+}
+
+async function syncSubscriptionEntitlement(stripe: Stripe, subscription: Stripe.Subscription) {
+  if (!isMarketBriefSubscription(subscription)) return;
+  const customerId = typeof subscription.customer === "string" ? subscription.customer : subscription.customer?.id;
+  if (!customerId) return;
+  const identity = await emailFromSubscription(stripe, subscription);
+  if (!identity?.email) return;
+  const email = identity.email;
+  const entitled = await customerHasEntitlement(stripe, customerId);
+  if (entitled) {
+    await addPaidAudienceContact({ email, firstName: identity.firstName });
+  } else {
+    await removePaidAudienceContact(email);
+  }
 }
 
 export async function POST(request: Request) {
@@ -55,28 +91,13 @@ export async function POST(request: Request) {
 
   try {
     switch (event.type) {
-      case "checkout.session.completed": {
-        const session = event.data.object as Stripe.Checkout.Session;
-        if (session.mode === "subscription") {
-          const email =
-            session.customer_details?.email ??
-            session.customer_email ??
-            null;
-          if (email) {
-            await addPaidAudienceContact({
-              email,
-              firstName: session.metadata?.firstName || undefined,
-            });
-          }
-        }
-        break;
-      }
-      case "customer.subscription.deleted": {
+      case "customer.subscription.created":
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted":
+      case "customer.subscription.paused":
+      case "customer.subscription.resumed": {
         const subscription = event.data.object as Stripe.Subscription;
-        const email = await emailFromSubscription(stripe, subscription);
-        if (email) {
-          await removePaidAudienceContact(email);
-        }
+        await syncSubscriptionEntitlement(stripe, subscription);
         break;
       }
       default:
